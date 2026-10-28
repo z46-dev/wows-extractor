@@ -18,6 +18,7 @@ type extractCommand struct {
 	GameDir       string   `arg:"positional,required" help:"World of Warships install directory"`
 	Output        string   `arg:"-o,--output" help:"Archive path (default: wows-BUILD.zip in the current directory)"`
 	Include       []string `arg:"--include,separate" help:"Virtual path or directory prefix to include; repeatable"`
+	All           bool     `arg:"--all" help:"Include every indexed game file"`
 	ClientVersion string   `arg:"--client-version" help:"Exact client version when known"`
 	Quiet         bool     `arg:"-q,--quiet" help:"Hide extraction progress"`
 }
@@ -71,10 +72,14 @@ func run(args arguments) (err error) {
 		percent     int
 		lastPercent int = -1
 		report      func(wowsextractor.Progress)
+		prefixes    []string
 	)
 
 	switch {
 	case args.Extract != nil:
+		if prefixes, err = extractPrefixes(*args.Extract); err != nil {
+			return
+		}
 		ctx, stop = signal.NotifyContext(context.Background(), os.Interrupt)
 		defer stop()
 		if !args.Extract.Quiet {
@@ -99,7 +104,7 @@ func run(args arguments) (err error) {
 				}
 			}
 		}
-		if archivePath, err = wowsextractor.ExtractWithProgress(ctx, args.Extract.GameDir, args.Extract.Output, args.Extract.Include, args.Extract.ClientVersion, report); err != nil {
+		if archivePath, err = wowsextractor.ExtractWithProgress(ctx, args.Extract.GameDir, args.Extract.Output, prefixes, args.Extract.ClientVersion, report); err != nil {
 			return
 		}
 		if loader != nil {
@@ -158,6 +163,25 @@ func run(args arguments) (err error) {
 		}
 
 		err = json.NewEncoder(os.Stdout).Encode(entries)
+	}
+
+	return
+}
+
+// extractPrefixes chooses the default data set or an explicit file selection.
+func extractPrefixes(args extractCommand) (prefixes []string, err error) {
+	if args.All && len(args.Include) > 0 {
+		err = fmt.Errorf("--all and --include cannot be combined")
+		return
+	}
+
+	switch {
+	case args.All:
+		prefixes = nil
+	case len(args.Include) > 0:
+		prefixes = args.Include
+	default:
+		prefixes = []string{"scripts/", "content/GameParams.data", "bin/res/texts/"}
 	}
 
 	return
