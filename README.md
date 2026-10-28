@@ -17,13 +17,14 @@ A Go implementation of wowsunpack, a CLI/API program to extract information from
 
 ```sh
 go run ./cmd/wows-extractor extract "/path/to/World of Warships"
+go run ./cmd/wows-extractor extract "/path/to/World of Warships" --quiet
 go run ./cmd/wows-extractor query wows-BUILD.zip scripts/entity_defs/
 go run ./cmd/wows-extractor query wows-BUILD.zip content/GameParams.data --output GameParams.data
 go run ./cmd/wows-extractor query wows-BUILD.zip PASA --region NA
 go run ./cmd/wows-extractor query wows-BUILD.zip PASA001 --region NA --output param.json
 ```
 
-`extract` writes `wows-BUILD.zip` in the current directory unless `--output` is set. It refuses to replace an existing archive. Use repeated `--include` flags to copy only particular virtual paths or directory prefixes. Package resources use paths such as `scripts/entities.xml`; loose build resources use `bin/res/...`. `--client-version` records a known full version in the archive manifest.
+`extract` writes `wows-BUILD.zip` in the current directory unless `--output` is set. It refuses to replace an existing archive. An interactive terminal shows extraction progress; `--quiet` or `-q` hides it. The archive path is still printed when extraction completes. Use repeated `--include` flags to copy only particular virtual paths or directory prefixes. Package resources use paths such as `scripts/entities.xml`; loose build resources use `bin/res/...`. `--client-version` records a known full version in the archive manifest.
 
 You can also install the CLI with `go install github.com/z46-dev/wows-extractor/cmd/wows-extractor@latest` and run it as `wows-extractor`.
 
@@ -68,6 +69,8 @@ func inspect() (err error) {
 ```
 
 `Archive.Query` and `GameParams.Query` are case-sensitive prefix searches. `Archive` implements `fs.FS` and can be shared across concurrent readers. `LoadGameParams` is an explicit, memory-intensive decode; load a region once and share its immutable result across requests. Close the archive after all readers are finished. ZIP entries and the manifest use portable forward-slash paths.
+
+Programs can use `ExtractWithProgress` to receive copied and total byte counts without depending on the CLI's logging library. `Extract` remains available when progress is not needed. Cancellation removes an incomplete temporary archive.
 
 Replay-specific catalogs and renderer file layout can be adapted in `wows-replay-parser` using these archived files. The current port covers IDX v20/v40, PKG reads, and GameParams conversion. `assets.bin` subfiles and Rust's model and texture exporters are not yet implemented.
 

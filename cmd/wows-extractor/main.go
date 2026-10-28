@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 
 	"github.com/alexflint/go-arg"
+	"github.com/z46-dev/golog"
 	wowsextractor "github.com/z46-dev/wows-extractor"
 )
 
@@ -17,6 +19,7 @@ type extractCommand struct {
 	Output        string   `arg:"-o,--output" help:"Archive path (default: wows-BUILD.zip in the current directory)"`
 	Include       []string `arg:"--include,separate" help:"Virtual path or directory prefix to include; repeatable"`
 	ClientVersion string   `arg:"--client-version" help:"Exact client version when known"`
+	Quiet         bool     `arg:"-q,--quiet" help:"Hide extraction progress"`
 }
 
 type queryCommand struct {
@@ -60,12 +63,47 @@ func run(args arguments) (err error) {
 		value       json.RawMessage
 		reader      io.ReadCloser
 		output      *os.File
+		loader      *golog.Loader
+		ctx         context.Context
+		stop        context.CancelFunc
+		info        os.FileInfo
+		statErr     error
+		percent     int
+		lastPercent int = -1
+		report      func(wowsextractor.Progress)
 	)
 
 	switch {
 	case args.Extract != nil:
-		if archivePath, err = wowsextractor.Extract(context.Background(), args.Extract.GameDir, args.Extract.Output, args.Extract.Include, args.Extract.ClientVersion); err != nil {
+		ctx, stop = signal.NotifyContext(context.Background(), os.Interrupt)
+		defer stop()
+		if !args.Extract.Quiet {
+			if info, statErr = os.Stdout.Stat(); statErr == nil && info.Mode()&os.ModeCharDevice != 0 {
+				loader = golog.New().Loader("Indexing game files...", golog.LoaderASCII, 10).Start()
+				defer loader.Stop()
+				report = func(progress wowsextractor.Progress) {
+					if progress.Total <= 0 {
+						return
+					}
+					if progress.Completed == 0 {
+						loader.SetMessage("Copying game files...")
+					}
+					percent = int(float64(progress.Completed) * 100 / float64(progress.Total))
+					if percent != lastPercent {
+						loader.SetProgress(float64(progress.Completed) / float64(progress.Total))
+						if percent >= 100 {
+							loader.SetMessage("Finalizing archive...")
+						}
+						lastPercent = percent
+					}
+				}
+			}
+		}
+		if archivePath, err = wowsextractor.ExtractWithProgress(ctx, args.Extract.GameDir, args.Extract.Output, args.Extract.Include, args.Extract.ClientVersion, report); err != nil {
 			return
+		}
+		if loader != nil {
+			loader.SetProgress(1).Stop()
 		}
 
 		fmt.Fprintln(os.Stdout, archivePath)

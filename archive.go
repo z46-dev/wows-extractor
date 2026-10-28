@@ -30,6 +30,24 @@ type Entry struct {
 	Size uint64 `json:"size"`
 }
 
+type Progress struct {
+	Completed int64
+	Total     int64
+}
+
+type looseResource struct {
+	relative, name string
+	size           int64
+}
+
+type copyWriter struct {
+	writer    io.Writer
+	ctx       context.Context
+	completed *int64
+	total     int64
+	report    func(Progress)
+}
+
 type Archive struct {
 	file     *os.File
 	reader   *zip.Reader
@@ -43,8 +61,16 @@ var _ fs.FS = (*Archive)(nil)
 // Extract copies the latest installed build into a portable ZIP archive.
 // Prefixes limit extraction when provided; an empty list includes every indexed file.
 func Extract(ctx context.Context, gameDir, output string, prefixes []string, clientVersion string) (archivePath string, err error) {
+	archivePath, err = ExtractWithProgress(ctx, gameDir, output, prefixes, clientVersion, nil)
+
+	return
+}
+
+// ExtractWithProgress reports copied input bytes while building the archive.
+func ExtractWithProgress(ctx context.Context, gameDir, output string, prefixes []string, clientVersion string, report func(Progress)) (archivePath string, err error) {
 	var (
 		source            gameidx.Source
+		loose             []looseResource
 		packageRoot       *os.Root
 		file              *os.File
 		writer            *zip.Writer
@@ -54,8 +80,10 @@ func Extract(ctx context.Context, gameDir, output string, prefixes []string, cli
 		fileHeader        *zip.FileHeader
 		manifestData      []byte
 		written, expected int64
-		statErr           error
-		closeErr          error
+		completed, total  int64
+		tempPath          string
+		committed         bool
+		statErr, closeErr error
 	)
 
 	if source, err = gameidx.Discover(gameDir); err != nil {
@@ -90,13 +118,35 @@ func Extract(ctx context.Context, gameDir, output string, prefixes []string, cli
 			return
 		}
 	}
+	for _, entry := range source.Entries {
+		if included(entry.Path, prefixes) {
+			total += int64(entry.File.Size)
+		}
+	}
+	if loose, err = listLooseResources(ctx, gameDir, source.Build, prefixes); err != nil {
+		return
+	}
+	for _, resource := range loose {
+		total += resource.size
+	}
+	if report != nil {
+		report(Progress{Completed: 0, Total: total})
+	}
 
 	if file, err = os.CreateTemp(filepath.Dir(archivePath), ".wows-extractor-*.tmp"); err != nil {
 		return
 	}
-
-	defer os.Remove(file.Name())
-	defer file.Close()
+	tempPath = file.Name()
+	defer func() {
+		if file != nil {
+			err = errors.Join(err, file.Close())
+		}
+		if !committed {
+			if closeErr = os.Remove(tempPath); closeErr != nil && !errors.Is(closeErr, os.ErrNotExist) {
+				err = errors.Join(err, closeErr)
+			}
+		}
+	}()
 	defer func() {
 		for _, pkg := range pkgFiles {
 			if closeErr = pkg.Close(); closeErr != nil {
@@ -153,7 +203,7 @@ func Extract(ctx context.Context, gameDir, output string, prefixes []string, cli
 		}
 
 		expected = int64(entry.File.Size)
-		if written, err = io.Copy(entryWriter, io.NewSectionReader(pkgFile, int64(entry.File.Offset), expected)); err != nil {
+		if written, err = io.Copy(&copyWriter{writer: entryWriter, ctx: ctx, completed: &completed, total: total, report: report}, io.NewSectionReader(pkgFile, int64(entry.File.Offset), expected)); err != nil {
 			return
 		}
 
@@ -163,7 +213,7 @@ func Extract(ctx context.Context, gameDir, output string, prefixes []string, cli
 		}
 	}
 
-	if err = writeLooseResources(writer, gameDir, source.Build, prefixes); err != nil {
+	if err = writeLooseResources(ctx, writer, gameDir, source.Build, loose, &completed, total, report); err != nil {
 		return
 	}
 
@@ -187,47 +237,55 @@ func Extract(ctx context.Context, gameDir, output string, prefixes []string, cli
 		return
 	}
 
-	if err = file.Close(); err != nil {
+	closeErr = file.Close()
+	file = nil
+	if closeErr != nil {
+		err = closeErr
 		return
 	}
 
-	if err = os.Rename(file.Name(), archivePath); err != nil {
+	if err = os.Rename(tempPath, archivePath); err != nil {
 		return
+	}
+	committed = true
+	if report != nil {
+		report(Progress{Completed: total, Total: total})
 	}
 
 	return
 }
 
-// writeLooseResources includes every unpackaged file under the selected build's res directory.
-func writeLooseResources(writer *zip.Writer, gameDir, build string, prefixes []string) (err error) {
+// listLooseResources collects selected build files and their byte counts before copying.
+func listLooseResources(ctx context.Context, gameDir, build string, prefixes []string) (resources []looseResource, err error) {
 	var (
-		root     string = filepath.Join(gameDir, "bin", build, "res")
+		rootPath string = filepath.Join(gameDir, "bin", build, "res")
 		readRoot *os.Root
 		statErr  error
 	)
 
-	if _, statErr = os.Stat(root); errors.Is(statErr, os.ErrNotExist) {
+	if _, statErr = os.Stat(rootPath); errors.Is(statErr, os.ErrNotExist) {
 		return
 	} else if statErr != nil {
 		err = statErr
 		return
 	}
-	if readRoot, err = os.OpenRoot(root); err != nil {
+	if readRoot, err = os.OpenRoot(rootPath); err != nil {
 		return
 	}
 	defer func() {
 		err = errors.Join(err, readRoot.Close())
 	}()
-	err = filepath.WalkDir(root, func(sourcePath string, entry fs.DirEntry, readErr error) (walkErr error) {
+	err = filepath.WalkDir(rootPath, func(sourcePath string, entry fs.DirEntry, readErr error) (walkErr error) {
 		var (
 			relative, archiveName string
-			file                  *os.File
-			entryWriter           io.Writer
-			closeErr              error
+			info                  os.FileInfo
 		)
 
 		if readErr != nil {
 			walkErr = readErr
+			return
+		}
+		if walkErr = ctx.Err(); walkErr != nil {
 			return
 		}
 		if entry.IsDir() {
@@ -237,26 +295,79 @@ func writeLooseResources(writer *zip.Writer, gameDir, build string, prefixes []s
 			walkErr = fmt.Errorf("symlink in build resources: %s", sourcePath)
 			return
 		}
-		if relative, walkErr = filepath.Rel(root, sourcePath); walkErr != nil {
+		if relative, walkErr = filepath.Rel(rootPath, sourcePath); walkErr != nil {
 			return
 		}
 		archiveName = "bin/res/" + filepath.ToSlash(relative)
 		if !included(archiveName, prefixes) {
 			return
 		}
-		if file, walkErr = readRoot.Open(relative); walkErr != nil {
+		if info, walkErr = readRoot.Lstat(relative); walkErr != nil {
 			return
 		}
-		if entryWriter, walkErr = writer.Create(archiveName); walkErr != nil {
-			walkErr = errors.Join(walkErr, file.Close())
+		if !info.Mode().IsRegular() {
+			walkErr = fmt.Errorf("non-regular build resource: %s", sourcePath)
 			return
 		}
-		_, walkErr = io.Copy(entryWriter, file)
-		if closeErr = file.Close(); walkErr == nil {
-			walkErr = closeErr
-		}
+		resources = append(resources, looseResource{relative: relative, name: archiveName, size: info.Size()})
+
 		return
 	})
+	return
+}
+
+// writeLooseResources adds selected unpackaged files under the selected build's res directory.
+func writeLooseResources(ctx context.Context, writer *zip.Writer, gameDir, build string, resources []looseResource, completed *int64, total int64, report func(Progress)) (err error) {
+	var (
+		readRoot    *os.Root
+		file        *os.File
+		entryWriter io.Writer
+		closeErr    error
+	)
+
+	if len(resources) == 0 {
+		return
+	}
+	if readRoot, err = os.OpenRoot(filepath.Join(gameDir, "bin", build, "res")); err != nil {
+		return
+	}
+	defer func() {
+		err = errors.Join(err, readRoot.Close())
+	}()
+
+	for _, resource := range resources {
+		if err = ctx.Err(); err != nil {
+			return
+		}
+		if file, err = readRoot.Open(resource.relative); err != nil {
+			return
+		}
+		if entryWriter, err = writer.Create(resource.name); err != nil {
+			err = errors.Join(err, file.Close())
+			return
+		}
+		_, err = io.Copy(&copyWriter{writer: entryWriter, ctx: ctx, completed: completed, total: total, report: report}, file)
+		closeErr = file.Close()
+		if err = errors.Join(err, closeErr); err != nil {
+			return
+		}
+	}
+
+	return
+}
+
+// Write forwards copied bytes and reports progress after each successful write.
+func (counter *copyWriter) Write(data []byte) (written int, err error) {
+	if err = counter.ctx.Err(); err != nil {
+		return
+	}
+	if written, err = counter.writer.Write(data); written > 0 {
+		*counter.completed += int64(written)
+		if counter.report != nil {
+			counter.report(Progress{Completed: *counter.completed, Total: counter.total})
+		}
+	}
+
 	return
 }
 

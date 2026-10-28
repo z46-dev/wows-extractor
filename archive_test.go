@@ -5,6 +5,7 @@ import (
 	"compress/flate"
 	"context"
 	"encoding/binary"
+	stderrors "errors"
 	"fmt"
 	"hash/crc32"
 	"io"
@@ -126,6 +127,12 @@ func TestArchiveRoundTrip(t *testing.T) {
 		dirEntries           []fs.DirEntry
 		wait                 sync.WaitGroup
 		errors               chan error = make(chan error, 16)
+		cancelContext        context.Context
+		cancel               context.CancelFunc
+		cancelPath           string = filepath.Join(t.TempDir(), "cancel.zip")
+		temporary            []string
+		lastProgress         wowsextractor.Progress
+		sawPartial           bool
 		err                  error
 	)
 
@@ -162,9 +169,31 @@ func TestArchiveRoundTrip(t *testing.T) {
 	if err = os.WriteFile(filepath.Join(gameDir, "res_packages", "test.pkg"), compressed.Bytes(), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	cancelContext, cancel = context.WithCancel(context.Background())
+	if _, err = wowsextractor.ExtractWithProgress(cancelContext, gameDir, cancelPath, nil, "", func(progress wowsextractor.Progress) {
+		if progress.Completed > 0 {
+			cancel()
+		}
+	}); !stderrors.Is(err, context.Canceled) {
+		t.Fatalf("canceled extraction error = %v", err)
+	}
+	if temporary, err = filepath.Glob(filepath.Join(filepath.Dir(cancelPath), ".wows-extractor-*.tmp")); err != nil || len(temporary) != 0 {
+		t.Fatalf("temporary files after cancellation = %v, %v", temporary, err)
+	}
 
-	if archivePath, err = wowsextractor.Extract(context.Background(), gameDir, archivePath, nil, "1.0.0.42"); err != nil {
+	if archivePath, err = wowsextractor.ExtractWithProgress(context.Background(), gameDir, archivePath, nil, "1.0.0.42", func(progress wowsextractor.Progress) {
+		lastProgress = progress
+		if progress.Completed > 0 && progress.Completed < progress.Total {
+			sawPartial = true
+		}
+	}); err != nil {
 		t.Fatal(err)
+	}
+	if lastProgress.Total == 0 || lastProgress.Completed != lastProgress.Total || !sawPartial {
+		t.Fatalf("final progress = %+v", lastProgress)
+	}
+	if temporary, err = filepath.Glob(filepath.Join(filepath.Dir(archivePath), ".wows-extractor-*.tmp")); err != nil || len(temporary) != 0 {
+		t.Fatalf("temporary files after success = %v, %v", temporary, err)
 	}
 
 	if archive, err = wowsextractor.Load(archivePath); err != nil {
