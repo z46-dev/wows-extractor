@@ -1,3 +1,6 @@
+![Tests](https://img.shields.io/github/actions/workflow/status/z46-dev/wows-extractor/ci.yml?branch=main&event=push&label=CI)
+![Made with Golang](https://img.shields.io/badge/-Made_with_Golang-007d9c?logo=go&logoColor=white)
+
 # wows-extractor
 
 A Go implementation of wowsunpack, a CLI/API program to extract information from a World of Warships installation.
