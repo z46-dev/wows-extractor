@@ -31,3 +31,8 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# LLMs
+.codex/
+graphify-out/
+scratch-work/
