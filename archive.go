@@ -2,6 +2,8 @@ package wowsextractor
 
 import (
 	"archive/zip"
+	"bytes"
+	"compress/flate"
 	"context"
 	"encoding/json"
 	"errors"
@@ -14,6 +16,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/z46-dev/wows-extractor/internal/gameconstants"
 	"github.com/z46-dev/wows-extractor/internal/gameidx"
 )
 
@@ -58,11 +61,57 @@ type Archive struct {
 
 var _ fs.FS = (*Archive)(nil)
 
+// readReplayConstantModules reads selected Python bytecode modules from scripts.zip.
+func readReplayConstantModules(scriptPath string) (modules map[string][]byte, err error) {
+	var (
+		archive *zip.ReadCloser
+		file    *zip.File
+		reader  io.ReadCloser
+		data    []byte
+	)
+
+	modules = make(map[string][]byte)
+	if archive, err = zip.OpenReader(scriptPath); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			err = nil
+		}
+		return
+	}
+
+	defer func() {
+		err = errors.Join(err, archive.Close())
+	}()
+
+	for _, file = range archive.File {
+		switch file.Name {
+		case "scripts/m140717bd.pyc", "scripts/Version.pyc", "scripts/m865ba929.pyc", "scripts/m1966847e.pyc", "scripts/SharedDataConstants.pyc", "scripts/Avatar.pyc":
+		default:
+			continue
+		}
+
+		if reader, err = file.Open(); err != nil {
+			return
+		}
+
+		if data, err = io.ReadAll(reader); err != nil {
+			_ = reader.Close()
+			return
+		}
+
+		if err = reader.Close(); err != nil {
+			return
+		}
+
+		modules[file.Name] = data
+	}
+
+	return
+}
+
 // Extract copies the latest installed build into a portable ZIP archive.
 // Prefixes limit extraction when provided; an empty list includes every indexed file.
 func Extract(ctx context.Context, gameDir, output string, prefixes []string, clientVersion string) (archivePath string, err error) {
 	archivePath, err = ExtractWithProgress(ctx, gameDir, output, prefixes, clientVersion, nil)
-
 	return
 }
 
@@ -71,6 +120,9 @@ func ExtractWithProgress(ctx context.Context, gameDir, output string, prefixes [
 	var (
 		source            gameidx.Source
 		loose             []looseResource
+		constantsFiles    map[string][]byte = make(map[string][]byte)
+		scriptConstants   map[string][]byte
+		constantsData     []byte
 		packageRoot       *os.Root
 		file              *os.File
 		writer            *zip.Writer
@@ -89,12 +141,42 @@ func ExtractWithProgress(ctx context.Context, gameDir, output string, prefixes [
 	if source, err = gameidx.Discover(gameDir); err != nil {
 		return
 	}
+
 	if packageRoot, err = os.OpenRoot(source.PkgDir); err != nil {
 		return
 	}
+
 	defer func() {
 		err = errors.Join(err, packageRoot.Close())
 	}()
+
+	for _, entry := range source.Entries {
+		if !strings.HasPrefix(entry.Path, "gui/data/constants/") || !strings.HasSuffix(entry.Path, ".xml") {
+			continue
+		}
+
+		if constantsFiles[entry.Path], err = readIndexedResource(packageRoot, entry); err != nil {
+			err = fmt.Errorf("read %s: %w", entry.Path, err)
+			return
+		}
+	}
+
+	if len(constantsFiles) > 0 {
+		if scriptConstants, err = readReplayConstantModules(filepath.Join(gameDir, "bin", source.Build, "res", "scripts.zip")); err != nil {
+			return
+		}
+
+		if constantsData, err = gameconstants.GenerateWithScripts(constantsFiles, scriptConstants, source.Build); err != nil {
+			return
+		}
+	}
+
+	for _, entry := range source.Entries {
+		if entry.Path == "constants.json" && included(entry.Path, prefixes) && len(constantsData) > 0 {
+			err = fmt.Errorf("indexed resource conflicts with generated constants.json")
+			return
+		}
+	}
 
 	if output == "" {
 		output = "wows-" + source.Build + ".zip"
@@ -118,17 +200,22 @@ func ExtractWithProgress(ctx context.Context, gameDir, output string, prefixes [
 			return
 		}
 	}
+
 	for _, entry := range source.Entries {
 		if included(entry.Path, prefixes) {
 			total += int64(entry.File.Size)
 		}
 	}
+
 	if loose, err = listLooseResources(ctx, gameDir, source.Build, prefixes); err != nil {
 		return
 	}
+
 	for _, resource := range loose {
 		total += resource.size
 	}
+
+	total += int64(len(constantsData))
 	if report != nil {
 		report(Progress{Completed: 0, Total: total})
 	}
@@ -136,17 +223,20 @@ func ExtractWithProgress(ctx context.Context, gameDir, output string, prefixes [
 	if file, err = os.CreateTemp(filepath.Dir(archivePath), ".wows-extractor-*.tmp"); err != nil {
 		return
 	}
+
 	tempPath = file.Name()
 	defer func() {
 		if file != nil {
 			err = errors.Join(err, file.Close())
 		}
+
 		if !committed {
 			if closeErr = os.Remove(tempPath); closeErr != nil && !errors.Is(closeErr, os.ErrNotExist) {
 				err = errors.Join(err, closeErr)
 			}
 		}
 	}()
+
 	defer func() {
 		for _, pkg := range pkgFiles {
 			if closeErr = pkg.Close(); closeErr != nil {
@@ -217,6 +307,16 @@ func ExtractWithProgress(ctx context.Context, gameDir, output string, prefixes [
 		return
 	}
 
+	if len(constantsData) > 0 {
+		if entryWriter, err = writer.Create("constants.json"); err != nil {
+			return
+		}
+
+		if _, err = io.Copy(&copyWriter{writer: entryWriter, ctx: ctx, completed: &completed, total: total, report: report}, bytes.NewReader(constantsData)); err != nil {
+			return
+		}
+	}
+
 	if manifestData, err = json.Marshal(Manifest{FormatVersion: 2, Build: source.Build, ClientVersion: clientVersion}); err != nil {
 		return
 	}
@@ -250,6 +350,56 @@ func ExtractWithProgress(ctx context.Context, gameDir, output string, prefixes [
 	committed = true
 	if report != nil {
 		report(Progress{Completed: total, Total: total})
+	}
+
+	return
+}
+
+// readIndexedResource decompresses one indexed file for derived-data generation.
+func readIndexedResource(root *os.Root, entry gameidx.Entry) (data []byte, err error) {
+	var (
+		file         *os.File
+		section      *io.SectionReader
+		reader       io.Reader
+		decompressor io.ReadCloser
+		expected     int64
+	)
+
+	if entry.File.Offset > uint64(^uint64(0)>>1) || uint64(entry.File.Size) > uint64(^uint64(0)>>1)-entry.File.Offset {
+		err = fmt.Errorf("invalid volume extent")
+		return
+	}
+
+	if file, err = root.Open(entry.Volume); err != nil {
+		return
+	}
+
+	defer func() {
+		err = errors.Join(err, file.Close())
+	}()
+
+	section = io.NewSectionReader(file, int64(entry.File.Offset), int64(entry.File.Size))
+	reader = section
+
+	if entry.File.Compression != 0 {
+		decompressor = flate.NewReader(section)
+		defer func() {
+			err = errors.Join(err, decompressor.Close())
+		}()
+
+		reader = decompressor
+		expected = int64(entry.File.UnpackedSize)
+	} else {
+		expected = int64(entry.File.Size)
+	}
+
+	if data, err = io.ReadAll(io.LimitReader(reader, expected+1)); err != nil {
+		return
+	}
+
+	if int64(len(data)) != expected {
+		err = fmt.Errorf("unexpected uncompressed size: got %d, want %d", len(data), expected)
+		return
 	}
 
 	return
