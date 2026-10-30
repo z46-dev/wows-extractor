@@ -84,7 +84,7 @@ func readReplayConstantModules(scriptPath string) (modules map[string][]byte, er
 
 	for _, file = range archive.File {
 		switch file.Name {
-		case "scripts/m140717bd.pyc", "scripts/Version.pyc", "scripts/m865ba929.pyc", "scripts/m1966847e.pyc", "scripts/SharedDataConstants.pyc", "scripts/Avatar.pyc":
+		case "scripts/m140717bd.pyc", "scripts/Version.pyc", "scripts/m865ba929.pyc", "scripts/m1966847e.pyc", "scripts/SharedDataConstants.pyc", "scripts/Avatar.pyc", "scripts/DeathReason.pyc":
 		default:
 			continue
 		}
